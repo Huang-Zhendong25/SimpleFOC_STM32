@@ -1,177 +1,229 @@
 /**
- * INMOP FOC 开发板 —— SimpleFOC 有感 FOC 底层测试程序
+ * INMOP FOC 开发板 —— SimpleFOC 有感 FOC 底层测试程序（按键控制版 / 电压开环）
  *
  * 硬件配置（依据《INMOP_FOC开发板硬件详细设计说明》及板载官方例程）：
- *   MCU      : STM32F407VET6（PlatformIO 板级 black_f407ve）
- *   母线电压 : 12V（板子最大 30V / 30A）
- *   电机     : 3505 无刷电机，极对数 P = 10，Rs = 0.1Ω，Ls = 42.3µH
- *   编码器   : MT6701 磁编码器，ABZ 增量模式，1024 PPR -> 4 倍频 = 4096 CPR
- *              A -> PA6，B -> PA7，Z 未接
- *   PWM      : TIM1 六路互补
- *              A 相：PE9(高)/PE8(低)，B 相：PE11(高)/PE10(低)，C 相：PE13(高)/PE12(低)
- *   电流采样 : 2 路 CC6903SO-10A 霍尔电流传感器（10A，灵敏度 0.132 V/A），两相采样 + 第三相推算
- *              U 相 -> PC5 (ADC1_IN15)，W 相 -> PB1 (ADC1_IN9)
- *   电源保持 : PB10（软开关机 PWR 引脚，拉高保持供电）
+ *   MCU      : STM32F407VET6（PlatformIO 板级 genericSTM32F407VET6）
+ *   母线电压 : 12V
+ *   电机     : 3505 无刷，极对数 P = 10，Rs = 0.1Ω，Ls = 42.3µH
+ *   编码器   : MT6701 磁编 ABZ，1024 PPR -> 4096 CPR，A=PA6 B=PA7
+ *   PWM      : TIM1 六路互补 PE9/PE8, PE11/PE10, PE13/PE12
+ *   电流采样 : CC6903SO-10A 两相（0.132 V/A），U=PC5 W=PB1
+ *   电源保持 : PB10
  *
- * 本程序采用方式A：SimpleFOC 内置 Encoder（软件正交解码，零额外依赖），
- * 先以 velocity_openloop 模式验证 PWM、编码器与串口链路。
- * 注意：velocity_openloop 的 target 是“轴速度(rad/s)”，施加的电压幅值固定为 motor.voltage_limit。
+ * 控制模式：电压开环（velocity_openloop）
+ * 按键（内部上拉，按下为低电平）：
+ *   KEY1(PB12) 单击=使能，双击=失能
+ *   KEY2(PB13) 单击=速度+5，双击=速度-5
+ *   KEY3(PB14) 单击=反转
  */
 
 #include <Arduino.h>
 #include <SimpleFOC.h>
 
-/* =========================================================================
- * 1. 编码器：MT6701（ABZ 增量模式，方式A：软件正交解码）
- *    构造参数：A 引脚, B 引脚, PPR（4 倍频自动得 CPR = 4096）
- * ========================================================================= */
+/* ========== 编码器：MT6701 ABZ，软件正交解码 ========== */
 Encoder encoder = Encoder(PA6, PA7, 1024);
-
-// 编码器 A/B 通道中断回调（软件正交解码必须提供，否则不会计数）
 void doA() { encoder.handleA(); }
 void doB() { encoder.handleB(); }
 
-/* =========================================================================
- * 2. 驱动：BLDCDriver6PWM，TIM1 六路互补 PWM
- *    构造参数顺序：phA_h, phA_l, phB_h, phB_l, phC_h, phC_l
- * ========================================================================= */
+/* ========== 驱动：BLDCDriver6PWM（TIM1 六路互补） ========== */
 BLDCDriver6PWM driver = BLDCDriver6PWM(PE9, PE8, PE11, PE10, PE13, PE12);
 
-/* =========================================================================
- * 3. 电流采样：CC6903SO-10A 霍尔电流传感器（两相采样）
- *    输出电压 V = VCC/2 + 0.132*I，灵敏度 0.132 V/A（10A 量程）
- * ========================================================================= */
-#define CUR_SENS_SENSITIVITY 0.132f   // [V/A]
-#define CUR_SENS_ZERO_VOLT   1.65f    // VCC/2，VCC = 3.3V
-#define ADC_REF_VOLT         3.3f     // ADC 参考电压
-#define ADC_MAX              4095.0f  // 12 位 ADC
+/* ========== 电流采样：CC6903SO-10A 两相（0.132 V/A） ========== */
+#define CUR_SENS_SENSITIVITY 0.132f
+#define CUR_SENS_ZERO_VOLT   1.65f
+#define ADC_REF_VOLT         3.3f
+#define ADC_MAX              4095.0f
+#define PIN_CUR_U  PC5
+#define PIN_CUR_W  PB1
 
-#define PIN_CUR_U  PC5               // U 相电流采样
-#define PIN_CUR_W  PB1               // W 相电流采样（V 相由 iu+iv+iw=0 推算）
-
-// 用户自定义回调：读取三相电流，返回单位安培(A)
 PhaseCurrent_s readPhaseCurrents() {
   PhaseCurrent_s c;
-  // ADC 原始值 -> 电压 -> 电流：(零漂 - raw) * Vref/4095 / 灵敏度
   float iu = (CUR_SENS_ZERO_VOLT - analogRead(PIN_CUR_U) * ADC_REF_VOLT / ADC_MAX)
              / CUR_SENS_SENSITIVITY;
   float iw = (CUR_SENS_ZERO_VOLT - analogRead(PIN_CUR_W) * ADC_REF_VOLT / ADC_MAX)
              / CUR_SENS_SENSITIVITY;
-
-  c.a = iu;          // U 相
-  c.b = -iu - iw;    // V 相 = -U - W
-  c.c = iw;          // W 相
+  c.a = iu;
+  c.b = -iu - iw;
+  c.c = iw;
   return c;
 }
-
-// 用户自定义回调：电流采样初始化（配置 ADC 分辨率与引脚）
 void initPhaseCurrentSensing() {
   analogReadResolution(12);
   pinMode(PIN_CUR_U, INPUT);
   pinMode(PIN_CUR_W, INPUT);
 }
-
 GenericCurrentSense current_sense = GenericCurrentSense(readPhaseCurrents,
                                                         initPhaseCurrentSensing);
 
-/* =========================================================================
- * 4. 电机：极对数 P = 10
- * ========================================================================= */
+/* ========== 电机：极对数 10 ========== */
 BLDCMotor motor = BLDCMotor(10);
 
-// 串口命令行（用于实时调参）
-Commander commander = Commander(Serial);
+/* ========== 按键（内部上拉，按下为 LOW） ========== */
+#define PIN_KEY1 PB12
+#define PIN_KEY2 PB13
+#define PIN_KEY3 PB14
 
-// 命令行回调：设置 target（velocity_openloop 下 target 单位是 轴速度 rad/s）
-void doTarget(char* cmd) {
-  commander.scalar(&motor.target, cmd);
+#define DEBOUNCE_MS     20      // 消抖时间
+#define DOUBLE_CLICK_MS 300     // 双击判定窗口
+#define SPEED_STEP      5.0f    // 每次速度增量
+#define SPEED_MAX       50.0f   // 速度上限
+
+float targetSpeed = 0.0f;       // 当前速度设定值(rad/s)
+
+// 单击/双击检测状态机
+struct Button {
+  uint8_t pin;
+  bool state = false;            // 消抖后的稳定状态（true=按下）
+  bool lastReading = false;      // 上次原始读数
+  unsigned long lastDebounce = 0;
+  uint8_t pending = 0;           // 已检测到的点击次数（等待判定）
+  unsigned long releaseTime = 0; // 最近一次释放时间
+};
+
+enum ClickEvent { CLICK_NONE, CLICK_SINGLE, CLICK_DOUBLE };
+
+Button btn1 = { PIN_KEY1 };
+Button btn2 = { PIN_KEY2 };
+Button btn3 = { PIN_KEY3 };
+
+// 处理一个按键，返回本次事件：无 / 单击 / 双击
+ClickEvent updateButton(Button& b) {
+  ClickEvent ev = CLICK_NONE;
+  unsigned long now = millis();
+  bool reading = (digitalRead(b.pin) == LOW);  // 按下=true
+
+  // 消抖：读数变化时重新计时
+  if (reading != b.lastReading) {
+    b.lastDebounce = now;
+  }
+
+  // 读数稳定超过消抖时间后，才确认状态变化
+  if ((now - b.lastDebounce) >= DEBOUNCE_MS) {
+    if (reading != b.state) {
+      if (reading) {
+        b.pending++;          // 按下沿：点击次数+1
+      } else {
+        b.releaseTime = now;  // 释放沿：记录释放时间
+      }
+      b.state = reading;
+    }
+  }
+  b.lastReading = reading;
+
+  // 释放后超过双击窗口仍没再按：判定是单击还是双击
+  if (b.pending > 0 && !b.state && (now - b.releaseTime) >= DOUBLE_CLICK_MS) {
+    ev = (b.pending == 1) ? CLICK_SINGLE : CLICK_DOUBLE;
+    b.pending = 0;
+  }
+
+  return ev;
 }
 
-// 命令行回调：使能/失能电机（失能后不施加电压，用于安全停机）
-void doEnable(char* cmd) {
-  if (motor.enabled) {
-    motor.disable();
-    Serial.println("Motor disabled.");
-  } else {
+void handleButtons() {
+  ClickEvent e1 = updateButton(btn1);
+  ClickEvent e2 = updateButton(btn2);
+  ClickEvent e3 = updateButton(btn3);
+
+  // KEY1：单击使能，双击失能
+  if (e1 == CLICK_SINGLE) {
+    motor.target = targetSpeed;   // 使能时把当前速度设定应用上去
     motor.enable();
-    Serial.println("Motor enabled.");
+    Serial.println("KEY1 single: motor enabled");
+  } else if (e1 == CLICK_DOUBLE) {
+    motor.disable();
+    Serial.println("KEY1 double: motor disabled");
+  }
+
+  // KEY2：单击速度+5，双击速度-5
+  if (e2 == CLICK_SINGLE) {
+    targetSpeed = constrain(targetSpeed + SPEED_STEP, -SPEED_MAX, SPEED_MAX);
+    if (motor.enabled) motor.target = targetSpeed;  // 运行中实时生效
+    Serial.print("KEY2 single: speed = ");
+    Serial.println(targetSpeed);
+  } else if (e2 == CLICK_DOUBLE) {
+    targetSpeed = constrain(targetSpeed - SPEED_STEP, -SPEED_MAX, SPEED_MAX);
+    if (motor.enabled) motor.target = targetSpeed;
+    Serial.print("KEY2 double: speed = ");
+    Serial.println(targetSpeed);
+  }
+
+  // KEY3：单击反转（正在转动时也可直接反转）
+  if (e3 == CLICK_SINGLE) {
+    targetSpeed = -targetSpeed;
+    if (motor.enabled) motor.target = targetSpeed;  // 直接反向
+    Serial.print("KEY3 single: reversed, speed = ");
+    Serial.println(targetSpeed);
   }
 }
 
 void setup() {
-  // ★ 关键：PB10 是软开关机的“电源保持”引脚（官方例程 PWR_Pin = PB10）。
-  //   拉高才能让板子在松开电源键 / 复位后继续保持供电，否则板子会掉电。
+  // 电源保持：PB10 拉高
   pinMode(PB10, OUTPUT);
   digitalWrite(PB10, HIGH);
 
-  // ★ 板子 USB 串口(CH340) 接在 USART1 的 PB6(TX)/PB7(RX)，需重映射（默认是 PA9/PA10）
+  // 串口：只用于打印
   Serial.setRx(PB7);
   Serial.setTx(PB6);
   Serial.begin(115200);
   SimpleFOCDebug::enable(&Serial);
 
-  // ---- 驱动初始化 ----
-  driver.voltage_power_supply = 12;   // 母线电压 12V
-  driver.pwm_frequency = 20000;       // PWM 频率 20kHz（与官方例程一致）
-  driver.dead_zone = 0.02f;           // 死区 2%
+  // 按键（内部上拉）
+  pinMode(PIN_KEY1, INPUT_PULLUP);
+  pinMode(PIN_KEY2, INPUT_PULLUP);
+  pinMode(PIN_KEY3, INPUT_PULLUP);
+
+  // 驱动
+  driver.voltage_power_supply = 12;
+  driver.pwm_frequency = 20000;
+  driver.dead_zone = 0.02f;
   driver.init();
 
-  // ---- 电流采样初始化（必须在电机上电/转动前完成零点校准）----
+  // 电流采样（零点校准，必须在电机上电前）
   current_sense.linkDriver(&driver);
   current_sense.init();
 
-  // ---- 编码器初始化（方式A：软件正交解码）----
-  encoder.quadrature = Quadrature::ON; // 4 倍频：1024 PPR -> 4096 CPR
+  // 编码器
+  encoder.quadrature = Quadrature::ON;
   encoder.init();
-  encoder.enableInterrupts(doA, doB);  // 必须传入 A/B 回调，否则不计数
+  encoder.enableInterrupts(doA, doB);
   motor.linkSensor(&encoder);
 
-  // ---- 电机初始化 ----
+  // 电机（电压开环）
   motor.linkDriver(&driver);
   motor.linkCurrentSense(&current_sense);
-  motor.foc_modulation = FOCModulationType::SpaceVectorPWM; // SVPWM
-
-  motor.voltage_limit = 2;                    // 开环施加电压幅值（V），从小开始，避免堵转大电流
-  motor.voltage_sensor_align = 3;             // 传感器对齐电压（只在 initFOC 对齐瞬间使用）
-  motor.controller = MotionControlType::velocity_openloop; // 第一步：开环测速
+  motor.foc_modulation = FOCModulationType::SpaceVectorPWM;
+  motor.voltage_limit = 2;
+  motor.voltage_sensor_align = 3;
+  motor.controller = MotionControlType::velocity_openloop;
   motor.init();
 
-  // ---- 传感器/电流对齐 + 启动 FOC ----
   if (motor.initFOC()) {
     Serial.println("FOC ready.");
   } else {
     Serial.println("FOC init failed!");
   }
-
-  // 对齐完成后先失能，避免 target=0 时 velocity_openloop 仍以 voltage_limit 锁住电机产生堵转电流
   motor.disable();
 
-  Serial.println("Commands (115200):");
-  Serial.println("  E      -> enable/disable motor");
-  Serial.println("  T<val> -> set target velocity [rad/s], e.g. T20");
-  commander.add('T', doTarget, "target velocity [rad/s]");
-  commander.add('E', doEnable, "enable/disable motor");
-  _delay(1000);
+  Serial.println("KEY1: single=enable, double=disable");
+  Serial.println("KEY2: single=+5, double=-5");
+  Serial.println("KEY3: single=reverse");
 }
 
 void loop() {
   motor.loopFOC();
   motor.move();
+  handleButtons();
 
-  // 每秒打印一次编码器角度与速度，验证 MT6701 + 软件正交解码链路
-  static unsigned long last = 0;
-  if (millis() - last > 1000) {
-    last = millis();
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 1000) {
+    lastPrint = millis();
     Serial.print("enabled:");
     Serial.print(motor.enabled ? "1" : "0");
-    Serial.print("  angle:");
-    Serial.print(encoder.getAngle());
-    Serial.print(" rad  velocity:");
+    Serial.print("  speed:");
+    Serial.print(targetSpeed);
+    Serial.print("  vel:");
     Serial.print(encoder.getVelocity());
-    Serial.print(" rad/s  target:");
-    Serial.println(motor.target);
+    Serial.print(" rad/s  angle:");
+    Serial.println(encoder.getAngle());
   }
-
-  // 串口命令行处理
-  commander.run();
 }
