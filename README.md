@@ -3,7 +3,7 @@
 基于 [SimpleFOC](https://github.com/simplefoc/Arduino-FOC) 的 STM32 有感 FOC 电机驱动底层项目，目标逐层实现完整闭环（电压开环 → 电流闭环 → 速度闭环 → 位置闭环），面向具身智能电机驱动岗位的底层能力建设。
 
 - 开发环境：VSCode + PlatformIO（STM32duino）
-- 当前阶段：**速度闭环（velocity + foc_current 级联）**（已依次完成：电压开环、电流闭环、速度闭环）
+- 当前阶段：**位置闭环（angle + velocity + foc_current 三级级联）**（已依次完成：电压开环、电流闭环、速度闭环、位置闭环）
 
 ---
 
@@ -25,15 +25,15 @@
 ## 二、开发路线（整体流程）
 
 ```
-电压开环 ✅  →  电流闭环 ✅  →  速度闭环 ✅（当前）  →  位置闭环（待做）
+电压开环 ✅  →  电流闭环 ✅  →  速度闭环 ✅  →  位置闭环 ✅（当前）
 ```
 
 | 阶段 | 状态 | 控制目标 | 反馈量 | 电角度来源 |
 |---|---|---|---|---|
 | 电压开环 | ✅ 已实现 | 无（验证硬件链路） | 无 | 积分自生成 |
 | 电流闭环 | ✅ 已实现 | iq（转矩电流） | 三相电流 | 编码器 |
-| 速度闭环 | ✅ 已实现（当前） | 转速 | 编码器 | 编码器 |
-| 位置闭环 | 待做 | 转角 | 编码器 | 编码器 |
+| 速度闭环 | ✅ 已实现 | 转速 | 编码器 | 编码器 |
+| 位置闭环 | ✅ 已实现（当前） | 转角 | 编码器 | 编码器 |
 
 ---
 
@@ -100,8 +100,6 @@ uα, uβ
 | KEY2 (PB13) | 速度 +5 | 速度 −5 |
 | KEY3 (PB14) | 反转 | — |
 
-速度步长、上限、双击判定窗口等参数在 `main.cpp` 顶部宏里可改。
-
 ### 4.4 编译与烧录
 
 ```bash
@@ -164,8 +162,6 @@ I = Rs · 2π · BW = 0.1 · 2π · 500 ≈ 314
 | KEY1 (PB12) | 使能电机 | 失能电机 |
 | KEY2 (PB13) | 电流 +0.1A | 电流 −0.1A |
 | KEY3 (PB14) | 反转（iq 取反） | — |
-
-电流步长 `CURRENT_STEP`、上限 `CURRENT_MAX` 等可在 `main.cpp` 顶部宏里改。
 
 ### 5.4 ⚠️ 注意事项（重要）
 
@@ -238,8 +234,6 @@ motor.tuneCurrentController(500.0f);  // 内环电流 PI（保留）
 | KEY2 (PB13) | 速度 +5 rad/s | 速度 −5 rad/s |
 | KEY3 (PB14) | 反转 | — |
 
-速度步长 `SPEED_STEP=5`、上限 `SPEED_MAX=50` 在 `main.cpp` 顶部宏里可改。
-
 ### 6.4 ⚠️ 注意事项（重要）
 
 1. **速度 PI 参数尚未完成整定**：当前 `PID_velocity.P=0.5、I=10、D=0` 是**起步值**，需根据实测整定：
@@ -260,14 +254,64 @@ pio run -t upload    # 烧录（ST-Link SWD）
 
 ---
 
-## 七、后续阶段（待补充）
+## 七、实现四：位置闭环（angle + velocity + foc_current 三级级联）
 
-> 以下为占位说明，后续每实现一个阶段就补充“原理 + 实现”。
+### 7.1 原理
 
-### 7.1 位置闭环（待实现）
+位置闭环是**三级级联**：位置 P（外）→ 速度 PI（中）→ 电流 PI（内）。
 
-- 原理：最外层加位置环，位置误差 → 速度给定，控制转角。
-- 实现：`motor.controller = MotionControlType::angle`，整定位置 P。
+```
+target(角度) → 位置P → 速度给定 → 速度PI → iq* → 电流PI → SVPWM → PWM → 电机
+                 ↑                  ↑               ↑
+            实测角度(编码器)   实测速度(编码器)  实测电流(CC6903)
+```
+
+- 外环**位置 P**：角度误差 → 速度给定（像弹簧，越远越快）；
+- 中环**速度 PI**：速度误差 → iq 给定（复用实现三）；
+- 内环**电流 PI**：iq 跟踪（复用实现二）。
+
+### 7.2 代码结构（相对速度闭环的关键改动）
+
+```cpp
+motor.torque_controller = TorqueControlType::foc_current;  // 内环电流闭环（保留）
+motor.controller        = MotionControlType::angle;         // 外环位置闭环（由 velocity 改为 angle）
+
+motor.velocity_limit = 50;   // 向目标移动时的最大转速
+
+motor.P_angle.P = 20.0f;     // 位置 P（角度误差 → 速度给定，起步值）
+
+// 中环速度 PI 与内环电流 PI 均保留
+motor.PID_velocity.P = 0.5f;  motor.PID_velocity.I = 10.0f;  motor.PID_velocity.D = 0.0f;
+motor.LPF_velocity.Tf = 0.01f;
+motor.tuneCurrentController(500.0f);
+```
+
+### 7.3 按键控制
+
+| 按键 | 单击 | 双击 |
+|---|---|---|
+| KEY1 (PB12) | 使能电机 | 失能电机 |
+| KEY2 (PB13) | 目标角度 +0.5 rad | 目标角度 −0.5 rad |
+| KEY3 (PB14) | 回到零点 | — |
+
+角度步长 `ANGLE_STEP=0.5`、范围 `±2π` 在 `main.cpp` 顶部宏里可改。
+
+### 7.4 ⚠️ 注意事项（重要）
+
+1. **位置 P（`P_angle.P=20`）是起步值**：
+   - 角度超调 / 震荡 → 减小 `P_angle.P`；
+   - 到目标太慢 → 增大 `P_angle.P`。
+2. **位置环只用 P（不用 I）是刻意的**：稳态位置精度由中环速度 PI 的积分兜底，位置环再加积分会形成双积分器（饱和 + 振荡）。
+3. 速度 PI、电流方向等注意事项同实现二/三。
+
+### 7.5 编译与烧录
+
+```bash
+pio run              # 编译
+pio run -t upload    # 烧录（ST-Link SWD）
+```
+
+烧录/开发注意事项与 5.5 相同。
 
 ---
 
@@ -276,7 +320,7 @@ pio run -t upload    # 烧录（ST-Link SWD）
 ```
 SimpleFOC_STM32/
 ├── platformio.ini      # PlatformIO 工程配置（板级、库、烧录参数、串口修复宏）
-├── src/main.cpp        # 主程序（当前：速度闭环按键控制版）
+├── src/main.cpp        # 主程序（当前：位置闭环按键控制版）
 ├── include/            # 头文件（预留）
 ├── lib/                # 本地库（预留）
 └── test/               # 测试（预留）
