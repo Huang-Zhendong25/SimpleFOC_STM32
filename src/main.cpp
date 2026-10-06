@@ -1,5 +1,5 @@
 /**
- * INMOP FOC 开发板 —— SimpleFOC 有感 FOC 底层测试程序（按键控制版 / 电压开环）
+ * INMOP FOC 开发板 —— SimpleFOC 有感 FOC 电流闭环测试（按键控制版）
  *
  * 硬件配置（依据《INMOP_FOC开发板硬件详细设计说明》及板载官方例程）：
  *   MCU      : STM32F407VET6（PlatformIO 板级 genericSTM32F407VET6）
@@ -10,11 +10,11 @@
  *   电流采样 : CC6903SO-10A 两相（0.132 V/A），U=PC5 W=PB1
  *   电源保持 : PB10
  *
- * 控制模式：电压开环（velocity_openloop）
+ * 控制模式：电流闭环（foc_current，直接控制 iq = 转矩电流）
  * 按键（内部上拉，按下为低电平）：
  *   KEY1(PB12) 单击=使能，双击=失能
- *   KEY2(PB13) 单击=速度+5，双击=速度-5
- *   KEY3(PB14) 单击=反转
+ *   KEY2(PB13) 单击=电流+0.1A，双击=电流-0.1A
+ *   KEY3(PB14) 单击=反转（iq 取反）
  */
 
 #include <Arduino.h>
@@ -29,22 +29,23 @@ void doB() { encoder.handleB(); }
 BLDCDriver6PWM driver = BLDCDriver6PWM(PE9, PE8, PE11, PE10, PE13, PE12);
 
 /* ========== 电流采样：CC6903SO-10A 两相（0.132 V/A） ========== */
-#define CUR_SENS_SENSITIVITY 0.132f
-#define CUR_SENS_ZERO_VOLT   1.65f
+#define CUR_SENS_SENSITIVITY 0.132f   // [V/A]
+#define CUR_SENS_ZERO_VOLT   1.65f    // VCC/2
 #define ADC_REF_VOLT         3.3f
-#define ADC_MAX              4095.0f
+#define ADC_MAX              4095.0f  // 12 位 ADC
 #define PIN_CUR_U  PC5
 #define PIN_CUR_W  PB1
 
 PhaseCurrent_s readPhaseCurrents() {
   PhaseCurrent_s c;
+  // 注意：如果电流环发散 / iq 为负且电机狂抖，说明方向反了，把下面三行整体取负。
   float iu = (CUR_SENS_ZERO_VOLT - analogRead(PIN_CUR_U) * ADC_REF_VOLT / ADC_MAX)
              / CUR_SENS_SENSITIVITY;
   float iw = (CUR_SENS_ZERO_VOLT - analogRead(PIN_CUR_W) * ADC_REF_VOLT / ADC_MAX)
              / CUR_SENS_SENSITIVITY;
-  c.a = iu;
-  c.b = -iu - iw;
-  c.c = iw;
+  c.a = -iu;
+  c.b = iu + iw;
+  c.c = -iw;
   return c;
 }
 void initPhaseCurrentSensing() {
@@ -63,59 +64,50 @@ BLDCMotor motor = BLDCMotor(10);
 #define PIN_KEY2 PB13
 #define PIN_KEY3 PB14
 
-#define DEBOUNCE_MS     20      // 消抖时间
-#define DOUBLE_CLICK_MS 300     // 双击判定窗口
-#define SPEED_STEP      5.0f    // 每次速度增量
-#define SPEED_MAX       50.0f   // 速度上限
+#define DEBOUNCE_MS     20
+#define DOUBLE_CLICK_MS 300
+#define CURRENT_STEP    0.1f
+#define CURRENT_MAX     1.0f
 
-float targetSpeed = 0.0f;       // 当前速度设定值(rad/s)
+float targetCurrent = 0.0f;
 
-// 单击/双击检测状态机
 struct Button {
   uint8_t pin;
-  bool state = false;            // 消抖后的稳定状态（true=按下）
-  bool lastReading = false;      // 上次原始读数
+  bool state = false;
+  bool lastReading = false;
   unsigned long lastDebounce = 0;
-  uint8_t pending = 0;           // 已检测到的点击次数（等待判定）
-  unsigned long releaseTime = 0; // 最近一次释放时间
+  uint8_t pending = 0;
+  unsigned long releaseTime = 0;
 };
-
 enum ClickEvent { CLICK_NONE, CLICK_SINGLE, CLICK_DOUBLE };
-
 Button btn1 = { PIN_KEY1 };
 Button btn2 = { PIN_KEY2 };
 Button btn3 = { PIN_KEY3 };
 
-// 处理一个按键，返回本次事件：无 / 单击 / 双击
 ClickEvent updateButton(Button& b) {
   ClickEvent ev = CLICK_NONE;
   unsigned long now = millis();
-  bool reading = (digitalRead(b.pin) == LOW);  // 按下=true
+  bool reading = (digitalRead(b.pin) == LOW);
 
-  // 消抖：读数变化时重新计时
   if (reading != b.lastReading) {
     b.lastDebounce = now;
   }
-
-  // 读数稳定超过消抖时间后，才确认状态变化
   if ((now - b.lastDebounce) >= DEBOUNCE_MS) {
     if (reading != b.state) {
       if (reading) {
-        b.pending++;          // 按下沿：点击次数+1
+        b.pending++;
       } else {
-        b.releaseTime = now;  // 释放沿：记录释放时间
+        b.releaseTime = now;
       }
       b.state = reading;
     }
   }
   b.lastReading = reading;
 
-  // 释放后超过双击窗口仍没再按：判定是单击还是双击
   if (b.pending > 0 && !b.state && (now - b.releaseTime) >= DOUBLE_CLICK_MS) {
     ev = (b.pending == 1) ? CLICK_SINGLE : CLICK_DOUBLE;
     b.pending = 0;
   }
-
   return ev;
 }
 
@@ -124,9 +116,8 @@ void handleButtons() {
   ClickEvent e2 = updateButton(btn2);
   ClickEvent e3 = updateButton(btn3);
 
-  // KEY1：单击使能，双击失能
   if (e1 == CLICK_SINGLE) {
-    motor.target = targetSpeed;   // 使能时把当前速度设定应用上去
+    motor.target = targetCurrent;
     motor.enable();
     Serial.println("KEY1 single: motor enabled");
   } else if (e1 == CLICK_DOUBLE) {
@@ -134,25 +125,48 @@ void handleButtons() {
     Serial.println("KEY1 double: motor disabled");
   }
 
-  // KEY2：单击速度+5，双击速度-5
   if (e2 == CLICK_SINGLE) {
-    targetSpeed = constrain(targetSpeed + SPEED_STEP, -SPEED_MAX, SPEED_MAX);
-    if (motor.enabled) motor.target = targetSpeed;  // 运行中实时生效
-    Serial.print("KEY2 single: speed = ");
-    Serial.println(targetSpeed);
+    targetCurrent = constrain(targetCurrent + CURRENT_STEP, -CURRENT_MAX, CURRENT_MAX);
+    if (motor.enabled) motor.target = targetCurrent;
+    Serial.print("KEY2 single: iq target = ");
+    Serial.println(targetCurrent);
   } else if (e2 == CLICK_DOUBLE) {
-    targetSpeed = constrain(targetSpeed - SPEED_STEP, -SPEED_MAX, SPEED_MAX);
-    if (motor.enabled) motor.target = targetSpeed;
-    Serial.print("KEY2 double: speed = ");
-    Serial.println(targetSpeed);
+    targetCurrent = constrain(targetCurrent - CURRENT_STEP, -CURRENT_MAX, CURRENT_MAX);
+    if (motor.enabled) motor.target = targetCurrent;
+    Serial.print("KEY2 double: iq target = ");
+    Serial.println(targetCurrent);
   }
 
-  // KEY3：单击反转（正在转动时也可直接反转）
   if (e3 == CLICK_SINGLE) {
-    targetSpeed = -targetSpeed;
-    if (motor.enabled) motor.target = targetSpeed;  // 直接反向
-    Serial.print("KEY3 single: reversed, speed = ");
-    Serial.println(targetSpeed);
+    targetCurrent = -targetCurrent;
+    if (motor.enabled) motor.target = targetCurrent;
+    Serial.print("KEY3 single: reversed, iq target = ");
+    Serial.println(targetCurrent);
+  }
+}
+
+/* ========== 非阻塞串口打印（避免阻塞 FOC 循环导致顿挫） ========== */
+#define NBUF 96
+char nbuf[NBUF];
+volatile uint8_t nlen = 0;
+volatile uint8_t npos = 0;
+
+// 把一行状态格式化到 nbuf（只格式化，不发送）
+void printStatus() {
+  char iq[12], id[12], tg[12], vl[12];
+  dtostrf(motor.current.q, 0, 3, iq);
+  dtostrf(motor.current.d, 0, 3, id);
+  dtostrf(targetCurrent, 0, 2, tg);
+  dtostrf(encoder.getVelocity(), 0, 1, vl);
+  nlen = snprintf(nbuf, NBUF, "en:%d iq:%s id:%s target:%s vel:%s\r\n",
+                  motor.enabled ? 1 : 0, iq, id, tg, vl);
+  npos = 0;
+}
+
+// 每次 loop 调用一次：只发送缓冲区能容纳的字节，绝不阻塞
+void servicePrint() {
+  while (npos < nlen && Serial.availableForWrite() > 0) {
+    Serial.write(nbuf[npos++]);
   }
 }
 
@@ -167,7 +181,7 @@ void setup() {
   Serial.begin(115200);
   SimpleFOCDebug::enable(&Serial);
 
-  // 按键（内部上拉）
+  // 按键
   pinMode(PIN_KEY1, INPUT_PULLUP);
   pinMode(PIN_KEY2, INPUT_PULLUP);
   pinMode(PIN_KEY3, INPUT_PULLUP);
@@ -188,14 +202,23 @@ void setup() {
   encoder.enableInterrupts(doA, doB);
   motor.linkSensor(&encoder);
 
-  // 电机（电压开环）
+  // ---- 电机（电流闭环配置）----
   motor.linkDriver(&driver);
   motor.linkCurrentSense(&current_sense);
   motor.foc_modulation = FOCModulationType::SpaceVectorPWM;
-  motor.voltage_limit = 2;
+
+  motor.phase_resistance = 0.1f;
+  motor.phase_inductance = 42.3e-6f;
+
+  motor.torque_controller = TorqueControlType::foc_current;
+  motor.controller = MotionControlType::torque;
+
+  motor.voltage_limit = 2.0f;
+  motor.current_limit = 1.0f;
   motor.voltage_sensor_align = 3;
-  motor.controller = MotionControlType::velocity_openloop;
+
   motor.init();
+  motor.tuneCurrentController(500.0f);
 
   if (motor.initFOC()) {
     Serial.println("FOC ready.");
@@ -205,7 +228,7 @@ void setup() {
   motor.disable();
 
   Serial.println("KEY1: single=enable, double=disable");
-  Serial.println("KEY2: single=+5, double=-5");
+  Serial.println("KEY2: single=+0.1A, double=-0.1A");
   Serial.println("KEY3: single=reverse");
 }
 
@@ -214,16 +237,11 @@ void loop() {
   motor.move();
   handleButtons();
 
+  // 每 2 秒准备一次状态行（只格式化，不阻塞）
   static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 1000) {
+  if (millis() - lastPrint > 2000) {
     lastPrint = millis();
-    Serial.print("enabled:");
-    Serial.print(motor.enabled ? "1" : "0");
-    Serial.print("  speed:");
-    Serial.print(targetSpeed);
-    Serial.print("  vel:");
-    Serial.print(encoder.getVelocity());
-    Serial.print(" rad/s  angle:");
-    Serial.println(encoder.getAngle());
+    printStatus();
   }
+  servicePrint();  // 非阻塞逐字节发送
 }
