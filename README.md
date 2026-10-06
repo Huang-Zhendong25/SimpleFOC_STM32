@@ -3,7 +3,7 @@
 基于 [SimpleFOC](https://github.com/simplefoc/Arduino-FOC) 的 STM32 有感 FOC 电机驱动底层项目，目标逐层实现完整闭环（电压开环 → 电流闭环 → 速度闭环 → 位置闭环），面向具身智能电机驱动岗位的底层能力建设。
 
 - 开发环境：VSCode + PlatformIO（STM32duino）
-- 当前阶段：**电流闭环（foc_current）**（已依次完成：电压开环、电流闭环）
+- 当前阶段：**速度闭环（velocity + foc_current 级联）**（已依次完成：电压开环、电流闭环、速度闭环）
 
 ---
 
@@ -25,14 +25,14 @@
 ## 二、开发路线（整体流程）
 
 ```
-电压开环 ✅  →  电流闭环 ✅（当前）  →  速度闭环（待做）  →  位置闭环（待做）
+电压开环 ✅  →  电流闭环 ✅  →  速度闭环 ✅（当前）  →  位置闭环（待做）
 ```
 
 | 阶段 | 状态 | 控制目标 | 反馈量 | 电角度来源 |
 |---|---|---|---|---|
 | 电压开环 | ✅ 已实现 | 无（验证硬件链路） | 无 | 积分自生成 |
-| 电流闭环 | ✅ 已实现（当前） | iq（转矩电流） | 三相电流 | 编码器 |
-| 速度闭环 | 待做 | 转速 | 编码器 | 编码器 |
+| 电流闭环 | ✅ 已实现 | iq（转矩电流） | 三相电流 | 编码器 |
+| 速度闭环 | ✅ 已实现（当前） | 转速 | 编码器 | 编码器 |
 | 位置闭环 | 待做 | 转角 | 编码器 | 编码器 |
 
 ---
@@ -197,28 +197,86 @@ pio run -t upload    # 烧录（ST-Link SWD）
 
 ---
 
-## 六、后续阶段（待补充）
+## 六、实现三：速度闭环（velocity + foc_current 级联）
+
+### 6.1 原理
+
+速度闭环是**级联控制**：在电流环外再套一个速度 PI 外环。
+
+```
+target(速度) → 速度PI(外环) → iq* → 电流PI(内环) → uq/ud → SVPWM → PWM → 电机
+                   ↑                        ↑
+              实测速度(编码器)        实测电流(CC6903)
+```
+
+- 外环**速度 PI**：速度误差 → iq 给定（转矩），控制转速；
+- 内环**电流 PI**：iq 跟踪（复用实现二）；
+- 与电压开环的“速度”不同：这里是**转子实际转速的反馈控制**（有编码器反馈、被保证），空载也不会飞转。
+
+### 6.2 代码结构（相对电流闭环的关键改动）
+
+```cpp
+motor.torque_controller = TorqueControlType::foc_current;  // 内环电流闭环（保留）
+motor.controller        = MotionControlType::velocity;      // 外环速度闭环（由 torque 改为 velocity）
+
+motor.velocity_limit = 50;   // 最大转速 rad/s
+
+// 速度 PI（外环）
+motor.PID_velocity.P = 0.5f;
+motor.PID_velocity.I = 10.0f;
+motor.PID_velocity.D = 0.0f;
+motor.LPF_velocity.Tf = 0.01f;   // 速度低通滤波
+
+motor.tuneCurrentController(500.0f);  // 内环电流 PI（保留）
+```
+
+### 6.3 按键控制
+
+| 按键 | 单击 | 双击 |
+|---|---|---|
+| KEY1 (PB12) | 使能电机 | 失能电机 |
+| KEY2 (PB13) | 速度 +5 rad/s | 速度 −5 rad/s |
+| KEY3 (PB14) | 反转 | — |
+
+速度步长 `SPEED_STEP=5`、上限 `SPEED_MAX=50` 在 `main.cpp` 顶部宏里可改。
+
+### 6.4 ⚠️ 注意事项（重要）
+
+1. **速度 PI 参数尚未完成整定**：当前 `PID_velocity.P=0.5、I=10、D=0` 是**起步值**，需根据实测整定：
+   - 速度超调 / 震荡 → 减小 `P`；
+   - 稳态有偏差 / 跟不上 → 增大 `I`；
+   - 抖得厉害 → 增大 `LPF_velocity.Tf`（0.01 → 0.02）。
+2. 速度环空载也能稳速，这是相对电流环（空载飞转）的主要改进。
+3. 内环电流方向仍需与实现二一致地确认（`readPhaseCurrents()` 已取负）。
+
+### 6.5 编译与烧录
+
+```bash
+pio run              # 编译
+pio run -t upload    # 烧录（ST-Link SWD）
+```
+
+烧录/开发注意事项与 5.5 相同（`upload_speed=1000`、断电重启、PB10、`-DSERIAL_UART_INSTANCE=1`、非阻塞打印、零点校准时序）。
+
+---
+
+## 七、后续阶段（待补充）
 
 > 以下为占位说明，后续每实现一个阶段就补充“原理 + 实现”。
 
-### 6.1 速度闭环（待实现）
-
-- 原理：在电流环外加速度 PI 外环，速度误差 → iq 给定，控制转速。
-- 实现：`motor.controller = MotionControlType::velocity`，整定 `motor.PID_velocity`，电流环保持 `foc_current`。
-
-### 6.2 位置闭环（待实现）
+### 7.1 位置闭环（待实现）
 
 - 原理：最外层加位置环，位置误差 → 速度给定，控制转角。
 - 实现：`motor.controller = MotionControlType::angle`，整定位置 P。
 
 ---
 
-## 七、目录结构
+## 八、目录结构
 
 ```
 SimpleFOC_STM32/
 ├── platformio.ini      # PlatformIO 工程配置（板级、库、烧录参数、串口修复宏）
-├── src/main.cpp        # 主程序（当前：电流闭环按键控制版）
+├── src/main.cpp        # 主程序（当前：速度闭环按键控制版）
 ├── include/            # 头文件（预留）
 ├── lib/                # 本地库（预留）
 └── test/               # 测试（预留）
