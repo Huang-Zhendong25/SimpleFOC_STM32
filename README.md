@@ -3,7 +3,7 @@
 基于 [SimpleFOC](https://github.com/simplefoc/Arduino-FOC) 的 STM32 有感 FOC 电机驱动底层项目，目标逐层实现完整闭环（电压开环 → 电流闭环 → 速度闭环 → 位置闭环），面向具身智能电机驱动岗位的底层能力建设。
 
 - 开发环境：VSCode + PlatformIO（STM32duino）
-- 当前阶段：**电流闭环（foc_current，直接控制 iq = 转矩电流）**
+- 当前阶段：**电流闭环（foc_current）**（已依次完成：电压开环、电流闭环）
 
 ---
 
@@ -31,7 +31,7 @@
 | 阶段 | 状态 | 控制目标 | 反馈量 | 电角度来源 |
 |---|---|---|---|---|
 | 电压开环 | ✅ 已实现 | 无（验证硬件链路） | 无 | 积分自生成 |
-| 电流闭环 | ✅ 当前 | iq（转矩电流） | 三相电流 | 编码器 |
+| 电流闭环 | ✅ 已实现（当前） | iq（转矩电流） | 三相电流 | 编码器 |
 | 速度闭环 | 待做 | 转速 | 编码器 | 编码器 |
 | 位置闭环 | 待做 | 转角 | 编码器 | 编码器 |
 
@@ -67,19 +67,59 @@ uα, uβ
 
 ---
 
-## 四、已实现：电压开环（简要回顾）
+## 四、实现一：电压开环（velocity_openloop）
 
-上一阶段已提交的电压开环（`velocity_openloop`）：
+### 4.1 原理
 
-- 无反馈，电角度 `θe = ∫ωdt × P` 由积分生成，施加固定电压 `voltage_limit`；
-- 编码器只测速显示，电流采样只初始化、不参与控制；
-- 数据流只走 `反Park → SVPWM → PWM`。
+电压开环下**不采样电流、不使用编码器反馈**：
 
-> 详见历史提交“电压开环（velocity_openloop）代码 + README”。
+- `motor.target` 是目标速度（rad/s）；
+- 电角度由 `shaft_angle += target × Δt` 积分生成，`θe = shaft_angle × 极对数`；
+- 施加固定幅值电压 `voltage_limit`（2V）；
+- 编码器只用来测速/显示，不参与控制。
+
+数据流只走最后两段：
+
+```
+反 Park（自生成 θe）→ SVPWM → PWM
+```
+
+### 4.2 代码结构（`src/main.cpp`）
+
+- `Encoder encoder(PA6, PA7, 1024)`：编码器，`quadrature=ON` 四倍频，`enableInterrupts(doA, doB)` 挂中断。
+- `BLDCDriver6PWM driver(PE9, PE8, ...)`：TIM1 六路互补 PWM。
+- `GenericCurrentSense current_sense`：CC6903 两相电流采样（开环下只初始化、不参与控制）。
+- `BLDCMotor motor(10)`：极对数 10，`controller = MotionControlType::velocity_openloop`。
+- 按键单击/双击状态机（见 4.3）。
+
+### 4.3 按键控制
+
+| 按键 | 单击 | 双击 |
+|---|---|---|
+| KEY1 (PB12) | 使能电机 | 失能电机 |
+| KEY2 (PB13) | 速度 +5 | 速度 −5 |
+| KEY3 (PB14) | 反转 | — |
+
+速度步长、上限、双击判定窗口等参数在 `main.cpp` 顶部宏里可改。
+
+### 4.4 编译与烧录
+
+```bash
+pio run              # 编译
+pio run -t upload    # 烧录（ST-Link SWD）
+```
+
+**烧录注意（踩坑记录）**：
+
+1. `upload_speed = 1000`：SWD 降到 1MHz，否则软开关机板烧录/复位瞬间通信不稳，报 `HardFault / Polling failed`。
+2. 该板级烧录后不会自动复位运行，烧完需**断电重启板子**。
+3. `PB10` 拉高保持供电（软开关机电源保持）。
+4. 板子 USB 串口（CH340）接在 USART1 的 PB6(TX)/PB7(RX)，代码里用 `Serial.setRx(PB7)/setTx(PB6)` 重映射。
+5. 电流零点校准（`current_sense.init()`）必须在电机上电/转动之前完成。
 
 ---
 
-## 五、当前实现：电流闭环
+## 五、实现二：电流闭环（foc_current）
 
 ### 5.1 原理
 
@@ -96,9 +136,7 @@ target(iq 给定) → 电流 PI → uq/ud → 反Park → SVPWM → PWM → 电�
 - dq 两个电流 PI 分别控制 id→0、iq→target；
 - 电压从“目标”降级为“手段”（PI 的输出，受 `voltage_limit` 限幅）。
 
-### 5.2 代码结构（关键改动）
-
-相比电压开环，`src/main.cpp` 中电机的配置变为：
+### 5.2 代码结构（相对电压开环的关键改动）
 
 ```cpp
 motor.phase_resistance = 0.1f;      // Rs，用于 PI 整定
