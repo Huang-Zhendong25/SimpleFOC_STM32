@@ -1,6 +1,6 @@
 # SimpleFOC_STM32 —— INMOP FOC 开发板 有感 FOC 电机驱动
 
-基于 [SimpleFOC](https://github.com/simplefoc/Arduino-FOC) 的 STM32 有感 FOC 电机驱动底层项目，目标逐层实现完整闭环（电压开环 → 电流闭环 → 速度闭环 → 位置闭环），面向具身智能电机驱动岗位的底层能力建设。
+基于 [SimpleFOC](https://github.com/simplefoc/Arduino-FOC) 的 STM32 有感 FOC 电机驱动底层项目，目标逐层实现完整闭环（电压开环 → 电流闭环 → 速度闭环 → 位置闭环）。
 
 - 开发环境：VSCode + PlatformIO（STM32duino）
 - 当前阶段：**位置闭环（angle + velocity + foc_current 三级级联）**（已依次完成：电压开环、电流闭环、速度闭环、位置闭环）
